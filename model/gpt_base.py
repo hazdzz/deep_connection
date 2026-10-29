@@ -139,6 +139,99 @@ class FFN(nn.Module):
         return x
 
 
+class nGPTAttention(nn.Module):
+    def __init__(self, config: GPTConfig) -> None:
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        self.base_scale = 1.0 / math.sqrt(config.n_embd)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.sqk_init_value = 1.0
+        self.sqk_init_scaling = self.base_scale
+        self.sqk = nn.Parameter(torch.empty(config.n_embd))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.normal_(self.c_attn.weight, mean=0.0, std=self.base_scale)
+        init.normal_(self.c_proj.weight, mean=0.0, std=self.base_scale)
+        init.constant_(self.sqk, self.sqk_init_scaling)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, self.head_dim)
+        k = k.view(B, T, self.n_head, self.head_dim)
+        v = v.view(B, T, self.n_head, self.head_dim)
+
+        sqk = (self.sqk * (self.sqk_init_value / self.sqk_init_scaling)).view(1, 1, self.n_head, self.head_dim)
+        q = sqk * F.normalize(q, p=2.0, dim=-1)
+        k = sqk * F.normalize(k, p=2.0, dim=-1)
+
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True,
+            scale=math.sqrt(self.head_dim),
+        )
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)
+
+
+class nGPTFFN(nn.Module):
+    def __init__(self, config: GPTConfig) -> None:
+        super().__init__()
+        self.base_scale = 1.0 / math.sqrt(config.n_embd)
+        self.sqrt_d = math.sqrt(config.n_embd)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.gelu = nn.GELU()
+        self.su_init_value = 1.0
+        self.su_init_scaling = 1.0
+        self.su = nn.Parameter(torch.empty(4 * config.n_embd))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.normal_(self.c_fc.weight, mean=0.0, std=self.base_scale)
+        init.normal_(self.c_proj.weight, mean=0.0, std=self.base_scale)
+        init.constant_(self.su, self.su_init_scaling)
+
+    def forward(self, x: Tensor) -> Tensor:
+        su = self.su * ((self.su_init_value / self.su_init_scaling) * self.sqrt_d)
+        u = su * self.c_fc(x)
+        return self.c_proj(self.gelu(u))
+
+
+class nGPTBlock(nn.Module):
+    def __init__(self, config: GPTConfig) -> None:
+        super().__init__()
+        self.attn = nGPTAttention(config)
+        self.ffn = nGPTFFN(config)
+        self.alpha_init_value = 0.05
+        self.alpha_init_scaling = 1.0 / math.sqrt(config.n_embd)
+        self.attn_alpha = nn.Parameter(torch.empty(config.n_embd))
+        self.ffn_alpha = nn.Parameter(torch.empty(config.n_embd))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        self.attn.reset_parameters()
+        self.ffn.reset_parameters()
+        init.constant_(self.attn_alpha, self.alpha_init_scaling)
+        init.constant_(self.ffn_alpha, self.alpha_init_scaling)
+
+    def _update(self, h: Tensor, h_branch: Tensor, alpha: Tensor) -> Tensor:
+        lr = torch.abs(alpha * (self.alpha_init_value / self.alpha_init_scaling))
+        a_norm = F.normalize(h, dim=-1)
+        b_norm = F.normalize(h_branch, dim=-1)
+        return F.normalize(a_norm + lr * (b_norm - a_norm), dim=-1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self._update(x, self.attn(x), self.attn_alpha)
+        x = self._update(x, self.ffn(x), self.ffn_alpha)
+        return x
+
+
 class PreLNBlock(nn.Module):
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
@@ -198,10 +291,9 @@ class LNSBlock(nn.Module):
         self.layernorm_2.reset_parameters()
 
     def forward(self, x):
-        attn_layer_idx = 2 * self.layer_idx - 1
-        ffn_layer_idx = 2 * self.layer_idx
-        x = x + self.attn(self.layernorm_1(x) / math.sqrt(attn_layer_idx))
-        x = x + self.ffn(self.layernorm_2(x) / math.sqrt(ffn_layer_idx))
+        scale = 1.0 / math.sqrt(self.layer_idx)
+        x = x + self.attn(self.layernorm_1(x) * scale)
+        x = x + self.ffn(self.layernorm_2(x) * scale)
         return x
 
 
@@ -550,6 +642,15 @@ class GPT(nn.Module):
         else:
             self.register_parameter("gamma", None)
 
+        self.is_ngpt = config.deep_conn == 'ngpt'
+        if self.is_ngpt is True:
+            self.ngpt_base_scale = 1.0 / math.sqrt(config.n_embd)
+            self.sz_init_value = 1.0
+            self.sz_init_scaling = self.ngpt_base_scale
+            self.sz = nn.Parameter(torch.empty(config.vocab_size))
+        else:
+            self.register_parameter("sz", None)
+
         if config.deep_conn == 'preln':
             self.transformer = nn.ModuleDict(dict(
                 wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -680,6 +781,16 @@ class GPT(nn.Module):
                 ]),
                 ln_f = nn.LayerNorm(config.n_embd, bias=config.bias),
             ))
+        elif config.deep_conn == 'ngpt':
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                wpe = nn.Embedding(config.block_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([
+                    nGPTBlock(config) for _ in range(config.n_layer)
+                ]),
+                ln_f = nn.Identity(),
+            ))
         elif config.deep_conn in ('hc', 'mhc', 'mhclite'):
             assert config.hyper_conn_n > 1, \
                 f"deep_conn={config.deep_conn!r} needs hyper_conn_n > 1."
@@ -697,7 +808,7 @@ class GPT(nn.Module):
                 f"Unknown deep_conn: {config.deep_conn!r}. "
                 f"Valid options are: preln, postln, lns, periln, "
                 f"keel, predyt, predyisru, prederf, "
-                f"hc, mhc, mhclite, "
+                f"hc, mhc, mhclite, ngpt, "
                 f"geonorm, projspheretnorm, cayspheretnorm, pspheretnorm"
             )
 
@@ -714,8 +825,9 @@ class GPT(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        init.normal_(self.transformer.wte.weight, mean=0.0, std=0.02)
-        init.normal_(self.transformer.wpe.weight, mean=0.0, std=0.02)
+        emb_std = self.ngpt_base_scale if self.is_ngpt else 0.02
+        init.normal_(self.transformer.wte.weight, mean=0.0, std=emb_std)
+        init.normal_(self.transformer.wpe.weight, mean=0.0, std=emb_std)
 
         if self.normalize_input is True:
             if self.n_embd_sqrt >= 20.0:
@@ -723,12 +835,35 @@ class GPT(nn.Module):
             else:
                 init.constant_(self.gamma, math.log(math.expm1(self.n_embd_sqrt)))
 
+        if self.is_ngpt is True:
+            init.constant_(self.sz, self.sz_init_scaling)
+
         for block in self.transformer.h:
             block.reset_parameters()
 
         reset_fn = getattr(self.transformer.ln_f, "reset_parameters", None)
         if callable(reset_fn):
             reset_fn()
+
+        self.normalize_matrices()
+
+    @torch.no_grad()
+    def normalize_matrices(self) -> None:
+        """nGPT only: project every matrix back onto unit-norm vectors along the
+        embedding dimension. Called at init and after every optimizer step."""
+        if self.is_ngpt is not True:
+            return
+
+        def _renorm(w: Tensor, dim: int) -> None:
+            w.copy_(F.normalize(w, dim=dim))
+
+        _renorm(self.transformer.wte.weight, 1)          # (V, d), tied with lm_head
+        _renorm(self.transformer.wpe.weight, 1)          # (T, d)
+        for block in self.transformer.h:
+            _renorm(block.attn.c_attn.weight, 1)         # (3d, d)
+            _renorm(block.attn.c_proj.weight, 0)         # (d, d)
+            _renorm(block.ffn.c_fc.weight, 1)            # (4d, d)
+            _renorm(block.ffn.c_proj.weight, 0)          # (d, 4d)
 
     def get_num_params(self, non_embedding=True):
         """
@@ -756,6 +891,9 @@ class GPT(nn.Module):
         if self.normalize_input:
             x = F.normalize(x, dim=-1) * torch.clamp(F.softplus(self.gamma), min=1.0, max=self.n_embd_sqrt)
 
+        if self.is_ngpt:
+            x = F.normalize(x, dim=-1)
+
         if self.expand_stream is not None:
             x = self.expand_stream(x)
 
@@ -770,10 +908,14 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            if self.is_ngpt:
+                logits = logits * (self.sz * (self.sz_init_value / self.sz_init_scaling))
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            if self.is_ngpt:
+                logits = logits * (self.sz * (self.sz_init_value / self.sz_init_scaling))
             loss = None
 
         return logits, loss

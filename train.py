@@ -341,6 +341,13 @@ def train_step(cfg, model, optimizer, scaler, ctx, get_batch, X, Y, runtime):
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
 
+    # nGPT: re-normalize all matrices after the update (no-op for other methods)
+    raw_model = model.module if runtime["ddp"] else model
+    raw_model = getattr(raw_model, "_orig_mod", raw_model)
+    normalize_fn = getattr(raw_model, "normalize_matrices", None)
+    if callable(normalize_fn):
+        normalize_fn()
+
     return loss_accum, grad_norm, X, Y
 
 

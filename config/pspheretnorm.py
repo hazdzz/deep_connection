@@ -1,5 +1,6 @@
 deep_conn = "pspheretnorm"
-angle_upper_bound = 0.7853981633974483
+scale_residual_init = False
+angle_lower_bound = 1.5707963267948966
 decay_method = "lns"
 p = 0.5
 

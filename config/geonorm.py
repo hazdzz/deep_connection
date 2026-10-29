@@ -1,6 +1,7 @@
 deep_conn = "geonorm"
-angle_upper_bound = 0.7853981633974483
-decay_method = "harmonic"
+scale_residual_init = False
+angle_lower_bound = 1.5707963267948966
+decay_method = "lns"
 
 wandb_notes = "geonorm"
 out_prefix_method = "geonorm"
