@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Union, List, Optional, Tuple
 from typing import Any, ClassVar, Protocol, cast
 from torch import Size, Tensor
-from .norms import RMSNorm, SeeDNorm, GeoNorm, ProjSpheretNorm, CaySpheretNorm, pSpheretNorm
+from .norms import RMSNorm, KeelNorm, SeeDNorm, GeoNorm, ProjSpheretNorm, CaySpheretNorm, pSpheretNorm
 from .activations import DyT, DyISRU, Derf
 from .hyper_conn import hyper_conn_init_func
 
@@ -343,41 +343,41 @@ class PreSeeDNormBlock(nn.Module):
         return x
 
 
-class KEELBlock(nn.Module):
+class KeelBlock(nn.Module):
     def __init__(self, config: GPTConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.attn = CausalSelfAttention(config)
         self.ffn = FFN(config)
         self.alpha = 2.0 * config.n_layer
-        self.layernorm_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.layernorm_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.layernorm_3 = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.keelnorm_1 = KeelNorm(config.n_embd, bias=config.bias)
+        self.keelnorm_2 = KeelNorm(config.n_embd, bias=config.bias)
+        self.keelnorm_3 = KeelNorm(config.n_embd, bias=config.bias)
         if self.layer_idx == 1:
-            self.layernorm_4 = nn.Identity()
+            self.keelnorm_4 = nn.Identity()
         else:
-            self.layernorm_4 = nn.LayerNorm(config.n_embd, bias=config.bias)
+            self.keelnorm_4 = KeelNorm(config.n_embd, bias=config.bias)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         self.attn.reset_parameters()
         self.ffn.reset_parameters()
-        self.layernorm_1.reset_parameters()
-        self.layernorm_2.reset_parameters()
-        self.layernorm_3.reset_parameters()
-        reset_fn = getattr(self.layernorm_4, "reset_parameters", None)
+        self.keelnorm_1.reset_parameters()
+        self.keelnorm_2.reset_parameters()
+        self.keelnorm_3.reset_parameters()
+        reset_fn = getattr(self.keelnorm_4, "reset_parameters", None)
         if callable(reset_fn):
             reset_fn()
 
     def forward(self, x):
         if self.layer_idx == 1:
-            x = self.attn(self.layernorm_1(x)) + x
-            x = self.ffn(self.layernorm_2(x)) + x
-            x = self.layernorm_3(x)
-            x = self.layernorm_4(x)
+            x = self.attn(self.keelnorm_1(x)) + x
+            x = self.ffn(self.keelnorm_2(x)) + x
+            x = self.keelnorm_3(x)
+            x = self.keelnorm_4(x)
         else:
-            x = self.layernorm_2(self.alpha * x + self.attn(self.layernorm_1(x)))
-            x = self.layernorm_4(self.alpha * x + self.ffn(self.layernorm_3(x)))
+            x = self.keelnorm_2(self.alpha * x + self.attn(self.keelnorm_1(x)))
+            x = self.keelnorm_4(self.alpha * x + self.ffn(self.keelnorm_3(x)))
         return x
 
 
@@ -707,7 +707,7 @@ class GPT(nn.Module):
                 wpe = nn.Embedding(config.block_size, config.n_embd),
                 drop = nn.Dropout(config.dropout),
                 h = nn.ModuleList([
-                    KEELBlock(config, i + 1) for i in range(config.n_layer)
+                    KeelBlock(config, i + 1) for i in range(config.n_layer)
                 ]),
                 ln_f = nn.Identity(),
             ))

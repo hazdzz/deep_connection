@@ -44,7 +44,117 @@ class RMSNorm(nn.Module):
         return rmsnorm
 
 
+class ZCRMSNorm(nn.Module):
+    def __init__(
+        self, 
+        normalized_shape: Union[int, List[int], Size], 
+        eps: float = 1e-5, 
+        bias: bool = False
+    ) -> None:
+        super().__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.empty(self.normalized_shape))
+        self.ones = nn.Parameter(torch.ones(self.normalized_shape), requires_grad=False)
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.normalized_shape))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.zeros_(self.weight)
+        if self.bias is not None:
+            init.zeros_(self.bias)
+
+    def forward(self, input: Tensor) -> Tensor:
+        var = input.pow(2).mean(dim=-1, keepdim=True) + self.eps
+        input_norm = input * torch.rsqrt(var)
+
+        zc_rmsnorm = (self.weight + self.ones) * input_norm
+        
+        if self.bias is not None:
+            zc_rmsnorm = zc_rmsnorm + self.bias
+
+        return zc_rmsnorm
+
+
 class ScaleNorm(nn.Module):
+    def __init__(
+        self, 
+        normalized_shape: Union[int, List[int], Size], 
+        eps: float = 1e-5, 
+        bias: bool = False
+    ) -> None:
+        super().__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.empty(1))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.normalized_shape))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.ones_(self.gamma)
+        if self.bias is not None:
+            init.zeros_(self.bias)
+
+    def forward(self, input: Tensor) -> Tensor:
+        dims = tuple(range(-len(self.normalized_shape), 0))
+        norm = torch.linalg.vector_norm(input, ord=2, dim=dims, keepdim=True)
+        scalenorm = self.gamma * input / (norm + self.eps)
+        
+        if self.bias is not None:
+            scalenorm = scalenorm + self.bias
+
+        return scalenorm
+
+
+class KeelNorm(nn.Module):
+    def __init__(
+        self, 
+        normalized_shape: Union[int, List[int], Size], 
+        eps: float = 1e-5, 
+        bias: bool = False
+    ) -> None:
+        super().__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.empty(self.normalized_shape))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.normalized_shape))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.ones_(self.weight)
+        if self.bias is not None:
+            init.zeros_(self.bias)
+
+    def forward(self, input: Tensor) -> Tensor:
+        dims = tuple(range(-len(self.normalized_shape), 0))
+        norm = torch.linalg.vector_norm(input, ord=2, dim=dims, keepdim=True)
+        keelnorm = self.weight * input / (norm + self.eps)
+        
+        if self.bias is not None:
+            keelnorm = keelnorm + self.bias
+
+        return keelnorm
+
+
+class MScaleNorm(nn.Module):
     def __init__(
         self, 
         normalized_shape: Union[int, List[int], Size], 
@@ -78,12 +188,12 @@ class ScaleNorm(nn.Module):
         dims = tuple(range(-len(self.normalized_shape), 0))
         norm = torch.linalg.vector_norm(input, ord=2, dim=dims, keepdim=True)
         gamma = self.softplus(self.gamma)
-        scalenorm = gamma * input / (norm + self.eps)
+        m_scalenorm = gamma * input / (norm + self.eps)
         
         if self.bias is not None:
-            scalenorm = scalenorm + self.bias
+            m_scalenorm = m_scalenorm + self.bias
 
-        return scalenorm
+        return m_scalenorm
 
 
 class SeeDNorm(nn.Module):
